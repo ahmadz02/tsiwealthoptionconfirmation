@@ -364,6 +364,12 @@
   }
 
   // ---------- Adviser Table ----------
+  function hasAdPdfBeenSent(prop) {
+    return Array.isArray(prop?.auditEvents) && prop.auditEvents.some(event =>
+      event?.event_type === 'EMAIL_SENT' && event?.metadata?.purpose === 'AD_CLOSED_PDF'
+    );
+  }
+
   function renderAdviserTable() {
     const tbody = document.getElementById('documents-table-body');
     tbody.innerHTML = '';
@@ -410,6 +416,9 @@
           ${prop.status === 'CLOSED' ? `
             <button onclick="switchRole('review', '${prop.id}')" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition-all inline-flex items-center space-x-1">
               <i class="fa-solid fa-file-invoice"></i><span>View Cert</span>
+            </button>
+            <button id="ad-send-btn-${prop.dbId}" onclick="sendClosedPdfToAD('${prop.id}')" class="px-3 py-1.5 bg-brand-navy hover:opacity-90 text-white rounded-lg text-xs font-semibold shadow-sm transition-all inline-flex items-center space-x-1">
+              <i class="fa-solid fa-paper-plane"></i><span>${hasAdPdfBeenSent(prop) ? 'Resend to AD' : 'Send to AD'}</span>
             </button>` : ''}
           <button onclick="deleteProposal('${prop.id}')" title="Delete" class="p-2 text-rose-500 hover:bg-rose-50 rounded-lg text-xs transition-colors">
             <i class="fa-solid fa-trash"></i>
@@ -667,9 +676,16 @@
       </div>
 
       ${isClosed ? `
+        <div class="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex items-center justify-between gap-3">
+          <div>
+            <p class="text-xs font-bold uppercase tracking-wider text-emerald-700">Final Record Locked</p>
+            <p class="text-xs text-emerald-700/80 mt-0.5">Both signatures have been captured and this confirmation is closed.</p>
+          </div>
+          <i class="fa-solid fa-lock text-emerald-600"></i>
+        </div>
         <div class="pt-2 no-print">
           <button onclick="downloadCertificatePDF('${doc.id}')" class="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-sm font-semibold inline-flex items-center justify-center space-x-2">
-            <i class="fa-solid fa-file-pdf"></i><span>Download Signed PDF Certificate</span>
+            <i class="fa-solid fa-file-pdf"></i><span>Download Final Closed PDF</span>
           </button>
         </div>
         <div class="space-y-2 pt-2">
@@ -735,6 +751,9 @@
 
 
   function auditEventLabel(event) {
+    if (event?.event_type === 'EMAIL_SENT' && event?.metadata?.purpose === 'AD_CLOSED_PDF') {
+      return 'Closed PDF sent to AD';
+    }
     const labels = {
       CREATED: 'Confirmation created',
       EMAIL_SENT: 'Confirmation email sent',
@@ -786,120 +805,252 @@
   }
 
   // ---------- PDF Generation ----------
-  function downloadCertificatePDF(docId) {
-    const doc = proposals.find(p => p.id === docId);
-    if (!doc) return;
+  function buildCertificatePDF(doc) {
+    if (!doc) return null;
+    if (doc.status !== 'CLOSED') {
+      showToast('The final PDF is available only after the confirmation is closed.', 'error');
+      return null;
+    }
+
     const { jsPDF } = window.jspdf;
     const pdf = new jsPDF({ unit: 'pt', format: 'a4' });
     const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
     const margin = 40;
-    let y = 40;
+    const contentWidth = pageWidth - margin * 2;
+    const colGap = 20;
+    const colWidth = (contentWidth - colGap) / 2;
+    let y = 38;
 
+    const addFooter = (pageNo) => {
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(7.5);
+      pdf.setTextColor(120);
+      pdf.text(COMPANY_ADDRESS, pageWidth / 2, pageHeight - 32, { align: 'center' });
+      pdf.text(COMPANY_CONTACT, pageWidth / 2, pageHeight - 21, { align: 'center' });
+      pdf.text(`Final Record • ${doc.id} • Page ${pageNo}`, pageWidth / 2, pageHeight - 10, { align: 'center' });
+      pdf.setTextColor(0);
+    };
+
+    const fmtDateTime = (value) => {
+      if (!value) return '-';
+      return new Date(value).toLocaleString('en-MY', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit'
+      });
+    };
+
+    // Header
     pdf.addImage('data:image/png;base64,' + LOGO_BASE64, 'PNG', pageWidth / 2 - 60, y, 120, 32);
-    y += 50;
+    y += 48;
     pdf.setFont('helvetica', 'bold');
     pdf.setFontSize(13);
     pdf.text('CONFIRMATION OF RECOMMENDED SOLUTIONS', pageWidth / 2, y, { align: 'center' });
     y += 16;
     pdf.text('FOR TAKAFUL PRODUCTS', pageWidth / 2, y, { align: 'center' });
-    y += 25;
+    y += 18;
+    pdf.setFont('helvetica', 'normal');
+    pdf.setFontSize(8);
+    pdf.setTextColor(90);
+    pdf.text(`Final Closed Record • Ref: ${doc.id}`, pageWidth / 2, y, { align: 'center' });
+    pdf.setTextColor(0);
+    y += 22;
 
+    // Participant / certificate metadata
     pdf.setDrawColor(180);
     pdf.setLineWidth(0.5);
-    pdf.rect(margin, y, pageWidth - margin * 2, 30);
+    pdf.rect(margin, y, contentWidth, 48);
+    pdf.line(pageWidth / 2, y, pageWidth / 2, y + 48);
     pdf.setFont('helvetica', 'italic');
     pdf.setFontSize(8);
-    pdf.text('Name of Participant', margin + 5, y + 10);
-    pdf.text('Certificate No.', pageWidth / 2 + 15, y + 10);
-    pdf.setFont('helvetica', 'normal');
+    pdf.text('Name of Participant', margin + 8, y + 13);
+    pdf.text('Certificate No.', pageWidth / 2 + 8, y + 13);
+    pdf.setFont('helvetica', 'bold');
     pdf.setFontSize(10);
-    pdf.text(doc.participantName, margin + 5, y + 23);
-    pdf.text(doc.certificateNo, pageWidth / 2 + 15, y + 23);
-    y += 45;
+    pdf.text(pdf.splitTextToSize(doc.participantName || '-', colWidth - 12), margin + 8, y + 29);
+    pdf.text(pdf.splitTextToSize(doc.certificateNo || '-', colWidth - 12), pageWidth / 2 + 8, y + 29);
+    y += 60;
 
+    pdf.setFont('helvetica', 'normal');
     pdf.setFontSize(9);
     const introText = "I hereby inform the Company that with regard to the above participant's application for a new certificate, I have provided the options from the following Takaful operator for the participant's consideration:";
-    const introLines = pdf.splitTextToSize(introText, pageWidth - margin * 2);
+    const introLines = pdf.splitTextToSize(introText, contentWidth);
     pdf.text(introLines, margin, y);
-    y += introLines.length * 12 + 10;
+    y += introLines.length * 12 + 12;
 
+    // Operator table
+    pdf.setFillColor(245, 245, 245);
+    pdf.rect(margin, y - 10, contentWidth, 20, 'F');
     pdf.setFont('helvetica', 'bold');
     pdf.setFontSize(9);
-    pdf.text('No.', margin + 5, y);
-    pdf.text('Insurance Company / Takaful Operator', margin + 40, y);
-    pdf.text('Selected', pageWidth - margin - 40, y);
-    y += 6;
-    pdf.line(margin, y, pageWidth - margin, y);
-    y += 14;
+    pdf.text('No.', margin + 6, y + 3);
+    pdf.text('Takaful Operator Presented', margin + 42, y + 3);
+    pdf.text('Selected', pageWidth - margin - 46, y + 3);
+    y += 18;
     pdf.setFont('helvetica', 'normal');
     doc.operators.forEach((op, i) => {
-      pdf.text(String(i + 1), margin + 5, y);
-      pdf.text(op, margin + 40, y);
-      pdf.text('X', pageWidth - margin - 35, y);
-      y += 18;
+      pdf.line(margin, y - 9, pageWidth - margin, y - 9);
+      pdf.text(String(i + 1), margin + 8, y + 3);
+      pdf.text(pdf.splitTextToSize(op, contentWidth - 115), margin + 42, y + 3);
+      pdf.text('X', pageWidth - margin - 35, y + 3);
+      y += 20;
     });
+    pdf.line(margin, y - 9, pageWidth - margin, y - 9);
     y += 10;
-    const colWidth = (pageWidth - margin * 2) / 2 - 10;
-
-    pdf.setFont('helvetica', 'italic');
-    pdf.setFontSize(8);
-    pdf.text('Signed by the Participant', margin, y);
-    pdf.text('Signed by IFAR', margin + colWidth + 20, y);
-    y += 8;
-    if (doc.clientSignature) pdf.addImage(doc.clientSignature, 'PNG', margin, y, colWidth, 45);
-    if (doc.adviserSignature) pdf.addImage(doc.adviserSignature, 'PNG', margin + colWidth + 20, y, colWidth, 45);
-    y += 50;
-    pdf.setFont('helvetica', 'normal');
-    pdf.setFontSize(8);
-    pdf.text('Date: ' + new Date(doc.clientSignedAt).toLocaleDateString(), margin, y);
-    pdf.text('FAR Name: ' + doc.adviserName, margin + colWidth + 20, y);
-    y += 12;
-    pdf.text('Date: ' + new Date(doc.adviserSignedAt).toLocaleDateString(), margin + colWidth + 20, y);
-    y += 25;
-
-    // BNM compliance clause + Authorized Signature block (not captured digitally - left blank for manual/office use)
-    pdf.setDrawColor(180);
-    pdf.setLineWidth(0.5);
-    const clauseBoxHeight = 62;
-    pdf.rect(margin, y, pageWidth - margin * 2, clauseBoxHeight);
-    pdf.line(margin + colWidth + 20, y, margin + colWidth + 20, y + clauseBoxHeight);
-
-    pdf.setFont('helvetica', 'italic');
-    pdf.setFontSize(7.5);
-    const clauseText = 'Per Bank Negara Malaysia\u2019s document Prudent and Professional Conduct by Financial Advisers under clause 12.1, "An approved financial adviser shall provide suitable product options to meet customers\u2019 needs from at least three (3) different licensed insurers or licensed takaful operators for each class of insurance or takaful business".';
-    const clauseLines = pdf.splitTextToSize(clauseText, colWidth - 5);
-    pdf.text(clauseLines, margin + 5, y + 12);
-
-    pdf.setFont('helvetica', 'normal');
-    pdf.setFontSize(8);
-    pdf.text('.................................................', margin + colWidth + 35, y + 28);
-    pdf.setFont('helvetica', 'italic');
-    pdf.text('Authorized Signature', margin + colWidth + 60, y + 40);
-    pdf.setFont('helvetica', 'normal');
-    pdf.text('Name:', margin + colWidth + 25, y + 54);
-    y += clauseBoxHeight + 15;
 
     if (doc.remarks) {
-      pdf.setDrawColor(180);
-      pdf.rect(margin, y, pageWidth - margin * 2, 34);
+      const remarkLines = pdf.splitTextToSize(doc.remarks, contentWidth - 16);
+      const remarkHeight = Math.max(42, 24 + remarkLines.length * 10);
+      pdf.rect(margin, y, contentWidth, remarkHeight);
       pdf.setFont('helvetica', 'italic');
       pdf.setFontSize(8);
-      pdf.text('Remarks, if any:', margin + 5, y + 12);
+      pdf.text('Remarks', margin + 8, y + 13);
       pdf.setFont('helvetica', 'normal');
       pdf.setFontSize(9);
-      const remarkLines = pdf.splitTextToSize(doc.remarks, pageWidth - margin * 2 - 10);
-      pdf.text(remarkLines, margin + 5, y + 24);
-      y += 34 + 15;
+      pdf.text(remarkLines, margin + 8, y + 28);
+      y += remarkHeight + 12;
     }
 
-    const pageHeight = pdf.internal.pageSize.getHeight();
+    // Signature section
+    pdf.setFont('helvetica', 'bold');
+    pdf.setFontSize(9);
+    pdf.text('Participant Signature', margin, y);
+    pdf.text('IFAR Signature', margin + colWidth + colGap, y);
+    y += 8;
+    pdf.rect(margin, y, colWidth, 84);
+    pdf.rect(margin + colWidth + colGap, y, colWidth, 84);
+    if (doc.clientSignature) pdf.addImage(doc.clientSignature, 'PNG', margin + 8, y + 8, colWidth - 16, 42);
+    if (doc.adviserSignature) pdf.addImage(doc.adviserSignature, 'PNG', margin + colWidth + colGap + 8, y + 8, colWidth - 16, 42);
     pdf.setFont('helvetica', 'normal');
     pdf.setFontSize(7.5);
-    pdf.setTextColor(120);
-    pdf.text(COMPANY_ADDRESS, pageWidth / 2, pageHeight - 30, { align: 'center' });
-    pdf.text(COMPANY_CONTACT, pageWidth / 2, pageHeight - 20, { align: 'center' });
+    pdf.text(`Signed: ${fmtDateTime(doc.clientSignedAt)}`, margin + 8, y + 62);
+    pdf.text(`Participant: ${doc.participantName || '-'}`, margin + 8, y + 74);
+    pdf.text(`Signed: ${fmtDateTime(doc.adviserSignedAt)}`, margin + colWidth + colGap + 8, y + 62);
+    pdf.text(`IFAR: ${doc.adviserName || '-'}`, margin + colWidth + colGap + 8, y + 74);
+    y += 98;
 
-    pdf.save(`Takaful-Confirmation-${doc.id}.pdf`);
+    // Regulatory clause + document status
+    const clauseText = 'Per Bank Negara Malaysia’s document Prudent and Professional Conduct by Financial Advisers under clause 12.1, an approved financial adviser shall provide suitable product options to meet customers’ needs from at least three (3) different licensed insurers or licensed takaful operators for each class of insurance or takaful business.';
+    const clauseLines = pdf.splitTextToSize(clauseText, contentWidth - 16);
+    const clauseHeight = 30 + clauseLines.length * 9;
+    pdf.rect(margin, y, contentWidth, clauseHeight);
+    pdf.setFont('helvetica', 'italic');
+    pdf.setFontSize(7.5);
+    pdf.text(clauseLines, margin + 8, y + 13);
+    pdf.setFont('helvetica', 'bold');
+    pdf.setFontSize(8);
+    pdf.text(`Document Status: CLOSED`, margin + 8, y + clauseHeight - 10);
+    pdf.setFont('helvetica', 'normal');
+    pdf.text(`Closed: ${fmtDateTime(doc.adviserSignedAt)}`, pageWidth - margin - 8, y + clauseHeight - 10, { align: 'right' });
+
+    addFooter(1);
+
+    // Page 2: Audit trail
+    const auditEvents = Array.isArray(doc.auditEvents) ? doc.auditEvents : [];
+    if (auditEvents.length) {
+      pdf.addPage();
+      y = 44;
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(14);
+      pdf.text('AUDIT TRAIL', margin, y);
+      pdf.setFontSize(8);
+      pdf.setFont('helvetica', 'normal');
+      pdf.setTextColor(90);
+      pdf.text(`Confirmation Ref: ${doc.id}`, margin, y + 15);
+      pdf.text(`Certificate No.: ${doc.certificateNo || '-'}`, margin, y + 27);
+      pdf.setTextColor(0);
+      y += 48;
+
+      auditEvents.forEach((event, idx) => {
+        if (y > pageHeight - 85) {
+          addFooter(pdf.internal.getNumberOfPages());
+          pdf.addPage();
+          y = 44;
+        }
+        const title = auditEventLabel(event);
+        const actor = event.actor_label || '-';
+        const when = fmtDateTime(event.occurred_at);
+        pdf.setDrawColor(210);
+        pdf.line(margin, y, pageWidth - margin, y);
+        y += 13;
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(9);
+        pdf.text(`${idx + 1}. ${title}`, margin, y);
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(8);
+        pdf.text(`Actor: ${actor}`, margin + 16, y + 13);
+        pdf.text(`Timestamp: ${when}`, margin + 16, y + 25);
+        y += 42;
+      });
+      addFooter(pdf.internal.getNumberOfPages());
+    }
+
+    const safeCert = String(doc.certificateNo || doc.id).replace(/[^a-z0-9_-]+/gi, '-');
+    return { pdf, filename: `Final-Takaful-Confirmation-${safeCert}.pdf` };
+  }
+
+  function downloadCertificatePDF(docId) {
+    const doc = proposals.find(p => p.id === docId);
+    const built = buildCertificatePDF(doc);
+    if (!built) return;
+    built.pdf.save(built.filename);
+  }
+
+  async function sendClosedPdfToAD(docId) {
+    const doc = proposals.find(p => p.id === docId);
+    if (!doc || doc.status !== 'CLOSED') {
+      showToast('Only a closed confirmation can be sent to AD.', 'error');
+      return;
+    }
+
+    const button = document.getElementById(`ad-send-btn-${doc.dbId}`);
+    const originalHtml = button?.innerHTML || '';
+    if (button) {
+      button.disabled = true;
+      button.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i><span>Sending...</span>';
+    }
+
+    try {
+      const built = buildCertificatePDF(doc);
+      if (!built) return;
+      const dataUri = built.pdf.output('datauristring');
+      const pdfBase64 = dataUri.includes(',') ? dataUri.split(',')[1] : dataUri;
+
+      const { data, error } = await supabaseClient.functions.invoke('send-confirmation-email', {
+        body: {
+          mode: 'ad_closed_pdf',
+          confirmationId: doc.dbId,
+          pdfBase64,
+          filename: built.filename
+        }
+      });
+
+      if (error) {
+        console.error(error);
+        let message = 'Unable to send the closed PDF to AD.';
+        try {
+          if (error.context && typeof error.context.json === 'function') {
+            const detail = await error.context.json();
+            if (detail?.error) message = detail.error;
+          }
+        } catch (_) {}
+        showToast(message, 'error');
+        return;
+      }
+
+      if (!data?.success) {
+        showToast(data?.error || 'Unable to send the closed PDF to AD.', 'error');
+        return;
+      }
+
+      showToast(`Closed PDF sent to AD${data.recipient ? ` (${data.recipient})` : ''}.`);
+      await loadConfirmations();
+    } finally {
+      if (button && document.body.contains(button)) {
+        button.disabled = false;
+        button.innerHTML = originalHtml;
+      }
+    }
   }
 
   // ---------- Utilities ----------

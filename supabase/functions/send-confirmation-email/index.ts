@@ -35,26 +35,97 @@ Deno.serve(async (req) => {
 
     const payload = await req.json().catch(() => ({}))
     const confirmationId = String(payload.confirmationId || '')
+    const mode = String(payload.mode || 'client_confirmation')
     if (!confirmationId) return json({ error: 'confirmationId is required' }, 400)
 
     const { data: confirmation, error: confirmationError } = await supabase
       .from('confirmation_requests')
-      .select('id, reference_no, participant_name, participant_email, adviser_name, public_token, status')
+      .select('id, reference_no, participant_name, participant_email, certificate_no, adviser_name, public_token, status')
       .eq('id', confirmationId)
       .single()
 
     if (confirmationError || !confirmation) return json({ error: 'Confirmation not found' }, 404)
-    if (confirmation.status !== 'AWAITING_CLIENT') {
-      return json({ error: 'This confirmation is no longer awaiting the client.' }, 409)
-    }
 
     const resendApiKey = Deno.env.get('RESEND_API_KEY')
     const emailFrom = Deno.env.get('EMAIL_FROM')
     const appBaseUrl = Deno.env.get('APP_BASE_URL')
     const emailReplyTo = Deno.env.get('EMAIL_REPLY_TO')
 
-    if (!resendApiKey || !emailFrom || !appBaseUrl) {
-      return json({ error: 'Email service is not configured. Set RESEND_API_KEY, EMAIL_FROM and APP_BASE_URL.' }, 500)
+    if (!resendApiKey || !emailFrom) {
+      return json({ error: 'Email service is not configured. Set RESEND_API_KEY and EMAIL_FROM.' }, 500)
+    }
+
+    if (mode === 'ad_closed_pdf') {
+      if (confirmation.status !== 'CLOSED') {
+        return json({ error: 'Only a closed confirmation can be sent to AD.' }, 409)
+      }
+
+      const adEmail = Deno.env.get('AD_EMAIL')
+      if (!adEmail) return json({ error: 'AD_EMAIL secret is not configured.' }, 500)
+
+      const pdfBase64 = String(payload.pdfBase64 || '')
+      const filename = String(payload.filename || `Final-Takaful-Confirmation-${confirmation.reference_no}.pdf`)
+      if (!pdfBase64 || pdfBase64.length < 1000) {
+        return json({ error: 'A valid closed PDF attachment is required.' }, 400)
+      }
+      if (pdfBase64.length > 20_000_000) {
+        return json({ error: 'The PDF attachment is too large to send.' }, 413)
+      }
+
+      const subject = `Closed Takaful Confirmation - ${confirmation.reference_no}`
+      const html = `
+        <div style="font-family:Arial,sans-serif;line-height:1.6;color:#1f2937;max-width:640px;margin:auto">
+          <h2 style="color:#212F6E">TSI Wealth Planners</h2>
+          <p>Dear AD,</p>
+          <p>A completed Takaful Confirmation has been closed by the adviser. The final signed PDF is attached for your record.</p>
+          <table style="border-collapse:collapse;width:100%;font-size:14px">
+            <tr><td style="padding:5px 0;color:#6b7280">Reference</td><td style="padding:5px 0"><strong>${escapeHtml(confirmation.reference_no)}</strong></td></tr>
+            <tr><td style="padding:5px 0;color:#6b7280">Participant</td><td style="padding:5px 0">${escapeHtml(confirmation.participant_name)}</td></tr>
+            <tr><td style="padding:5px 0;color:#6b7280">Certificate No.</td><td style="padding:5px 0">${escapeHtml(confirmation.certificate_no)}</td></tr>
+            <tr><td style="padding:5px 0;color:#6b7280">IFAR</td><td style="padding:5px 0">${escapeHtml(confirmation.adviser_name)}</td></tr>
+          </table>
+          <p>Thank you,<br><strong>${escapeHtml(confirmation.adviser_name)}</strong><br>TSI Wealth Planners</p>
+        </div>`
+
+      const resendBody: Record<string, unknown> = {
+        from: emailFrom,
+        to: [adEmail],
+        subject,
+        html,
+        attachments: [{ filename, content: pdfBase64 }],
+      }
+      if (emailReplyTo) resendBody.reply_to = emailReplyTo
+
+      const emailResponse = await sendWithResend(resendApiKey, resendBody)
+      if (!emailResponse.ok) return json({ error: emailResponse.error }, 502)
+
+      const { error: auditError } = await supabase.from('confirmation_audit_events').insert({
+        confirmation_id: confirmation.id,
+        adviser_id: userData.user.id,
+        event_type: 'EMAIL_SENT',
+        actor_type: 'ADVISER',
+        actor_label: confirmation.adviser_name,
+        metadata: {
+          reference_no: confirmation.reference_no,
+          recipient: adEmail,
+          purpose: 'AD_CLOSED_PDF',
+          attachment_filename: filename,
+          provider: 'resend',
+          provider_message_id: emailResponse.messageId,
+        },
+      })
+
+      if (auditError) console.error('Audit insert failed:', auditError)
+
+      return json({ success: true, messageId: emailResponse.messageId, recipient: adEmail, purpose: 'AD_CLOSED_PDF' })
+    }
+
+    // Default mode: send the secure client confirmation link.
+    if (confirmation.status !== 'AWAITING_CLIENT') {
+      return json({ error: 'This confirmation is no longer awaiting the client.' }, 409)
+    }
+    if (!appBaseUrl) {
+      return json({ error: 'APP_BASE_URL secret is not configured.' }, 500)
     }
 
     const clientUrl = `${appBaseUrl.replace(/\/$/, '')}/confirmation.html?token=${confirmation.public_token}`
@@ -80,20 +151,8 @@ Deno.serve(async (req) => {
     }
     if (emailReplyTo) resendBody.reply_to = emailReplyTo
 
-    const emailResponse = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${resendApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(resendBody),
-    })
-
-    const emailResult = await emailResponse.json().catch(() => ({}))
-    if (!emailResponse.ok) {
-      console.error('Resend error:', emailResult)
-      return json({ error: emailResult?.message || 'Email provider rejected the request' }, 502)
-    }
+    const emailResponse = await sendWithResend(resendApiKey, resendBody)
+    if (!emailResponse.ok) return json({ error: emailResponse.error }, 502)
 
     const { error: auditError } = await supabase.from('confirmation_audit_events').insert({
       confirmation_id: confirmation.id,
@@ -104,23 +163,39 @@ Deno.serve(async (req) => {
       metadata: {
         reference_no: confirmation.reference_no,
         recipient: confirmation.participant_email,
+        purpose: 'CLIENT_CONFIRMATION_LINK',
         provider: 'resend',
-        provider_message_id: emailResult?.id || null,
+        provider_message_id: emailResponse.messageId,
       },
     })
 
     if (auditError) console.error('Audit insert failed:', auditError)
 
-    return json({
-      success: true,
-      messageId: emailResult?.id || null,
-      recipient: confirmation.participant_email,
-    })
+    return json({ success: true, messageId: emailResponse.messageId, recipient: confirmation.participant_email })
   } catch (error) {
     console.error(error)
     return json({ error: error instanceof Error ? error.message : 'Unexpected server error' }, 500)
   }
 })
+
+async function sendWithResend(apiKey: string, body: Record<string, unknown>) {
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+
+  const result = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    console.error('Resend error:', result)
+    return { ok: false as const, error: result?.message || 'Email provider rejected the request', messageId: null }
+  }
+
+  return { ok: true as const, error: null, messageId: result?.id || null }
+}
 
 function escapeHtml(value: unknown) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
